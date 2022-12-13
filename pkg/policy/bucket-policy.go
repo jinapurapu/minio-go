@@ -31,16 +31,17 @@ type BucketPolicy string
 
 // Different types of Policies currently supported for buckets.
 const (
-	BucketPolicyNone      BucketPolicy = "none"
-	BucketPolicyReadOnly               = "readonly"
-	BucketPolicyReadWrite              = "readwrite"
-	BucketPolicyWriteOnly              = "writeonly"
+	BucketPolicyNone       BucketPolicy = "none"
+	BucketPolicyReadOnly                = "readonly"
+	BucketPolicyReadWrite               = "readwrite"
+	BucketPolicyWriteOnly               = "writeonly"
+	BucketPolicyReadNoList              = "readnolist"
 )
 
 // IsValidBucketPolicy - returns true if policy is valid and supported, false otherwise.
 func (p BucketPolicy) IsValidBucketPolicy() bool {
 	switch p {
-	case BucketPolicyNone, BucketPolicyReadOnly, BucketPolicyReadWrite, BucketPolicyWriteOnly:
+	case BucketPolicyNone, BucketPolicyReadOnly, BucketPolicyReadWrite, BucketPolicyWriteOnly, BucketPolicyReadNoList:
 		return true
 	}
 	return false
@@ -67,12 +68,16 @@ var writeOnlyObjectActions = set.CreateStringSet("s3:AbortMultipartUpload", "s3:
 // Read and write object actions.
 var readWriteObjectActions = readOnlyObjectActions.Union(writeOnlyObjectActions)
 
+// Read no list bucket actions.
+var readNoListBucketActions = set.CreateStringSet("s3:GetObject", "s3:GetObjectVersion")
+
 // All valid bucket and object actions.
 var validActions = commonBucketActions.
 	Union(readOnlyBucketActions).
 	Union(writeOnlyBucketActions).
 	Union(readOnlyObjectActions).
-	Union(writeOnlyObjectActions)
+	Union(writeOnlyObjectActions).
+	Union(readNoListBucketActions)
 
 var startsWithFunc = func(resource string, resourcePrefix string) bool {
 	return strings.HasPrefix(resource, resourcePrefix)
@@ -175,6 +180,24 @@ func newBucketStatement(policy BucketPolicy, bucketName string, prefix string) (
 	if policy == BucketPolicyReadOnly || policy == BucketPolicyReadWrite {
 		statement = Statement{
 			Actions:   readOnlyBucketActions,
+			Effect:    "Allow",
+			Principal: User{AWS: set.CreateStringSet("*")},
+			Resources: bucketResource,
+			Sid:       "",
+		}
+		if prefix != "" {
+			condKeyMap := make(ConditionKeyMap)
+			condKeyMap.Add("s3:prefix", set.CreateStringSet(prefix))
+			condMap := make(ConditionMap)
+			condMap.Add("StringEquals", condKeyMap)
+			statement.Conditions = condMap
+		}
+		statements = append(statements, statement)
+	}
+
+	if policy == BucketPolicyReadNoList {
+		statement = Statement{
+			Actions:   readNoListBucketActions,
 			Effect:    "Allow",
 			Principal: User{AWS: set.CreateStringSet("*")},
 			Resources: bucketResource,
@@ -430,10 +453,10 @@ func removeStatements(statements []Statement, bucketName string, prefix string) 
 	return out
 }
 
-//  Appends given statement into statement list to have unique statements.
-//  - If statement already exists in statement list, it ignores.
-//  - If statement exists with different conditions, they are merged.
-//  - Else the statement is appended to statement list.
+// Appends given statement into statement list to have unique statements.
+// - If statement already exists in statement list, it ignores.
+// - If statement exists with different conditions, they are merged.
+// - Else the statement is appended to statement list.
 func appendStatement(statements []Statement, statement Statement) []Statement {
 	for i, s := range statements {
 		if s.Actions.Equals(statement.Actions) &&
@@ -483,9 +506,9 @@ func appendStatements(statements []Statement, appendStatements []Statement) []St
 }
 
 // Returns policy of given bucket statement.
-func getBucketPolicy(statement Statement, prefix string) (commonFound, readOnly, writeOnly bool) {
+func getBucketPolicy(statement Statement, prefix string) (commonFound, readOnly, writeOnly, readNoList bool) {
 	if !(statement.Effect == "Allow" && statement.Principal.AWS.Contains("*")) {
-		return commonFound, readOnly, writeOnly
+		return commonFound, readOnly, writeOnly, readNoList
 	}
 
 	if statement.Actions.Intersection(commonBucketActions).Equals(commonBucketActions) &&
@@ -496,6 +519,11 @@ func getBucketPolicy(statement Statement, prefix string) (commonFound, readOnly,
 	if statement.Actions.Intersection(writeOnlyBucketActions).Equals(writeOnlyBucketActions) &&
 		statement.Conditions == nil {
 		writeOnly = true
+	}
+
+	if statement.Actions.Intersection(readNoListBucketActions).Equals(readNoListBucketActions) &&
+		statement.Conditions == nil {
+		readNoList = true
 	}
 
 	if statement.Actions.Intersection(readOnlyBucketActions).Equals(readOnlyBucketActions) {
@@ -520,7 +548,7 @@ func getBucketPolicy(statement Statement, prefix string) (commonFound, readOnly,
 		}
 	}
 
-	return commonFound, readOnly, writeOnly
+	return commonFound, readOnly, writeOnly, readNoList
 }
 
 // Returns policy of given object statement.
@@ -547,6 +575,7 @@ func GetPolicy(statements []Statement, bucketName string, prefix string) BucketP
 	bucketCommonFound := false
 	bucketReadOnly := false
 	bucketWriteOnly := false
+	bucketReadNoList := false
 	matchedResource := ""
 	objReadOnly := false
 	objWriteOnly := false
@@ -573,10 +602,11 @@ func GetPolicy(statements []Statement, bucketName string, prefix string) BucketP
 			}
 		}
 		if s.Resources.Contains(bucketResource) {
-			commonFound, readOnly, writeOnly := getBucketPolicy(s, prefix)
+			commonFound, readOnly, writeOnly, readNoList := getBucketPolicy(s, prefix)
 			bucketCommonFound = bucketCommonFound || commonFound
 			bucketReadOnly = bucketReadOnly || readOnly
 			bucketWriteOnly = bucketWriteOnly || writeOnly
+			bucketReadNoList = bucketReadNoList || readNoList
 		}
 	}
 
@@ -588,6 +618,8 @@ func GetPolicy(statements []Statement, bucketName string, prefix string) BucketP
 			policy = BucketPolicyReadOnly
 		} else if bucketWriteOnly && objWriteOnly {
 			policy = BucketPolicyWriteOnly
+		} else if bucketReadNoList {
+			policy = BucketPolicyReadNoList
 		}
 	}
 
